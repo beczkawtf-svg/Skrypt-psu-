@@ -1,0 +1,1325 @@
+-- BECZKA HUB
+-- Jeden kompletny skrypt: AutoFish + AutoClaimGift.
+-- Dotychczasowy lokalny kod dostępu z oryginalnego skryptu.
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local GS = game:GetService("GuiService")
+local PG = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+local env = _G
+if type(getgenv) == "function" then
+    env = getgenv()
+end
+
+-- Zatrzymanie wcześniejszych kopii.
+for _, name in ipairs({"__FishingAutoClick", "__AutoFishPanel"}) do
+    local previous = env[name]
+    if type(previous) == "table"
+        and type(previous.stop) == "function" then
+        pcall(previous.stop)
+    end
+end
+
+local S = {
+    alive = true,
+    starting = true,
+    unlocked = false,
+    fish = false,
+    gift = false,
+    incognito = false,
+    held = nil,
+    giftJob = nil
+}
+
+env.__AutoFishPanel = S
+
+local getConnections = env.getconnections or getconnections
+-- Test możliwości na prywatnym zdarzeniu, bez wywoływania funkcji gry.
+local function checkCallbackBackend()
+    if type(getConnections) ~= "function" then
+        return false, "Brak getconnections — odbiór w tle niedostępny."
+    end
+    local probe = Instance.new("BindableEvent")
+    local result, reason = false, "Nie udało się sprawdzić dostępu do funkcji."
+    local ok, err = pcall(function()
+        local empty = getConnections(probe.Event)
+        if type(empty) ~= "table" or next(empty) ~= nil then
+            reason = "getconnections zwraca fałszywe połączenia pustego zdarzenia."
+            return
+        end
+        local token, received = {}, nil
+        local connection = probe.Event:Connect(function(value) received = value end)
+        local list = getConnections(probe.Event)
+        if type(list) == "table" then
+            for _, item in pairs(list) do
+                local readable, callback = pcall(function() return item.Function end)
+                if readable and type(callback) == "function" then
+                    pcall(callback, token)
+                    if received == token then result = true;break end
+                end
+            end
+        end
+        connection:Disconnect()
+        reason = result and "Dostęp do funkcji potwierdzony."
+            or "getconnections nie udostępnia prawdziwej funkcji kontrolnego zdarzenia."
+    end)
+    probe:Destroy()
+    if not ok then return false, "Test getconnections zakończył się błędem: " .. tostring(err) end
+    return result, reason
+end
+
+local signalEmitter = env.firesignal or firesignal
+local rewardBackend
+local function checkSignalBackend()
+    if type(signalEmitter) ~= "function" then return false, "Brak firesignal." end
+    local probe = Instance.new("BindableEvent")
+    local token, received = {}, nil
+    local connection = probe.Event:Connect(function(value) received = value end)
+    local ok, err = pcall(signalEmitter, probe.Event, token)
+    if ok then
+        for _ = 1, 4 do
+            if received == token then break end
+            task.wait(0.05)
+        end
+    end
+    connection:Disconnect()
+    probe:Destroy()
+    if not ok then return false, "firesignal: " .. tostring(err) end
+    if received ~= token then return false, "firesignal nie wywołał zdarzenia testowego." end
+    return true, "firesignal przeszedł test zdarzenia."
+end
+local function checkRewardBackend()
+    -- Ominięcie atrapy getconnections przez osobny mechanizm zdarzeń.
+    local signalOK, signalReason = checkSignalBackend()
+    if signalOK then
+        rewardBackend = "signal"
+        return true, signalReason
+    end
+    local callbackOK, callbackReason = checkCallbackBackend()
+    if callbackOK then
+        rewardBackend = "callback"
+        return true, callbackReason
+    end
+    rewardBackend = nil
+    return false, "Brak działającego odbioru w tle. " .. signalReason
+end
+
+local connections = {}
+local activeTweens = {}
+
+local function animate(object, duration, properties)
+    if not S.alive or not object.Parent then return end
+    local tween = TweenService:Create(object,
+        TweenInfo.new(duration, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), properties)
+    activeTweens[tween] = true
+    tween.Completed:Once(function() activeTweens[tween] = nil end)
+    tween:Play()
+    return tween
+end
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+
+local function make(className, properties, parent)
+    local object = Instance.new(className)
+
+    for property, value in pairs(properties) do
+        object[property] = value
+    end
+
+    object.Parent = parent
+    return object
+end
+
+local function round(object, radius)
+    make("UICorner", {
+        CornerRadius = UDim.new(0, radius)
+    }, object)
+end
+
+local C = {
+    bg = Color3.fromRGB(12, 14, 23),
+    field = Color3.fromRGB(25, 29, 44),
+    white = Color3.fromRGB(244, 246, 255),
+    muted = Color3.fromRGB(179, 189, 212),
+    border = Color3.fromRGB(67, 73, 99),
+    violet = Color3.fromRGB(154, 117, 255),
+    blue = Color3.fromRGB(91, 154, 255),
+    cyan = Color3.fromRGB(103, 224, 233)
+}
+local function gradient(object, first, last, rotation)
+    return make("UIGradient", {
+        Color = ColorSequence.new(first, last), Rotation = rotation or 0
+    }, object)
+end
+local function outline(object, color, transparency, width)
+    return make("UIStroke", {Color = color, Transparency = transparency or 0,
+        Thickness = width or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, object)
+end
+local function textAt(parent, text, x, y, w, h, size, color, bold)
+    return make("TextLabel", {
+        Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h),
+        BackgroundTransparency = 1, Text = text, TextSize = size,
+        Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+        TextColor3 = color or C.white, TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true
+    }, parent)
+end
+local function surface(parent, x, y, w, h, color, radius)
+    local f = make("Frame", {Position = UDim2.fromOffset(x, y),
+        Size = UDim2.fromOffset(w, h), BackgroundColor3 = color,
+        BorderSizePixel = 0}, parent)
+    round(f, radius or 14)
+    return f
+end
+
+-- Gradient na CanvasGroup barwi także tekst i wszystkie dzieci.
+-- Osobna warstwa Frame ogranicza kolorowanie do samego tła.
+local function backgroundGradient(group, first, last, rotation, radius)
+    group.BackgroundTransparency = 1
+    group.GroupColor3 = Color3.new(1, 1, 1)
+    local background = make("Frame", {
+        Name = "GradientBackground", Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+        Active = false, ZIndex = 0
+    }, group)
+    round(background, radius)
+    return gradient(background, first, last, rotation)
+end
+
+local gui = make("ScreenGui", {
+    Name = "BeczkaHub", ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 100, ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+}, PG)
+local panel = make("CanvasGroup", {
+    GroupTransparency = 1, Visible = false,
+    Position = UDim2.fromOffset(24, 100), Size = UDim2.fromOffset(680, 480),
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0
+}, gui)
+round(panel, 24)
+backgroundGradient(panel, Color3.fromRGB(23, 25, 43), Color3.fromRGB(9, 13, 22), 48, 24)
+local edge = outline(panel, Color3.new(1, 1, 1), 0.38)
+gradient(edge, C.violet, C.cyan, 30)
+local panelScale = make("UIScale", {Scale = 1}, panel)
+local fitScale = 1
+local function fitPanel()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local size = camera.ViewportSize
+    fitScale = math.min(1, (size.X - 32) / 680, (size.Y - 32) / 480)
+    fitScale = math.max(0.3, fitScale)
+    panelScale.Scale = fitScale
+    panel.Position = UDim2.fromOffset(
+        math.clamp(panel.Position.X.Offset, 0, math.max(0, size.X - 680 * fitScale)),
+        math.clamp(panel.Position.Y.Offset, 0, math.max(0, size.Y - 480 * fitScale)))
+end
+fitPanel()
+if workspace.CurrentCamera then
+    connect(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), fitPanel)
+end
+local topLine = surface(panel, 28, 0, 624, 2, Color3.new(1, 1, 1), 1)
+local topGradient = gradient(topLine, C.violet, C.cyan)
+topGradient.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.25, 0.1),
+    NumberSequenceKeypoint.new(0.75, 0.1), NumberSequenceKeypoint.new(1, 1)})
+local title = textAt(panel, "beczkahub", 28, 21, 260, 33, 27, C.white, true)
+gradient(title, Color3.new(1, 1, 1), Color3.fromRGB(188, 199, 255), 15)
+textAt(panel, "T W O J E   C E N T R U M   S T E R O W A N I A", 29, 58, 410, 16, 9, C.muted)
+local edition = surface(panel, 448, 31, 100, 24, Color3.fromRGB(37, 35, 61), 12)
+outline(edition, C.violet, 0.65)
+local editionText = textAt(edition, "miłej gry <3", 0, 0, 100, 24, 9, Color3.fromRGB(198, 183, 255), true)
+editionText.TextXAlignment = Enum.TextXAlignment.Center
+
+local function interact(object, border)
+    local scale = make("UIScale", {Scale = 1}, object)
+    connect(object.MouseEnter, function()
+        animate(scale, 0.22, {Scale = 1.018})
+        if border then animate(border, 0.22, {Transparency = 0.2}) end
+    end)
+    connect(object.MouseLeave, function()
+        animate(scale, 0.28, {Scale = 1})
+        if border then animate(border, 0.28, {Transparency = 0.65}) end
+    end)
+    connect(object.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            animate(scale, 0.1, {Scale = 0.975})
+        end
+    end)
+    connect(object.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            animate(scale, 0.3, {Scale = 1})
+        end
+    end)
+end
+local function control(text, x)
+    local b = make("TextButton", {Position = UDim2.fromOffset(x, 27),
+        Size = UDim2.fromOffset(34, 34), BackgroundColor3 = C.field,
+        BorderSizePixel = 0, Text = text, TextColor3 = C.muted,
+        TextSize = 21, Font = Enum.Font.Gotham, AutoButtonColor = false}, panel)
+    round(b, 11)
+    interact(b, outline(b, C.border, 0.65))
+    return b
+end
+local minimize = control("−", 566)
+local close = control("×", 612)
+connect(close.MouseEnter, function() animate(close, 0.2, {TextColor3 = Color3.fromRGB(255, 137, 171)}) end)
+connect(close.MouseLeave, function() animate(close, 0.2, {TextColor3 = C.muted}) end)
+local divider = surface(panel, 28, 93, 624, 1, C.border, 1)
+divider.BackgroundTransparency = 0.55
+textAt(panel, "TWOJE FUNKCJE", 28, 115, 174, 18, 10, C.muted, true)
+local nav = {}
+local function navButton(key, name, caption, symbol, y)
+    local b = make("TextButton", {Position = UDim2.fromOffset(24, y),
+        Size = UDim2.fromOffset(192, 70), BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0, Text = "", AutoButtonColor = false}, panel)
+    round(b, 15)
+    gradient(b, Color3.fromRGB(47, 40, 74), Color3.fromRGB(24, 35, 53), 25)
+    local stroke = outline(b, C.violet, 0.65)
+    local icon = surface(b, 12, 16, 35, 35, Color3.fromRGB(57, 55, 87), 11)
+    local mark = textAt(icon, symbol, 0, 0, 35, 35, 17, C.white, true)
+    mark.TextXAlignment = Enum.TextXAlignment.Center
+    textAt(b, name, 59, 16, 126, 20, 13, C.white, true)
+    textAt(b, caption, 59, 39, 126, 15, 10, C.muted)
+    local dot = surface(b, 172, 10, 5, 5, C.muted, 3)
+    nav[key] = {button = b, border = stroke, icon = icon, dot = dot}
+    interact(b, stroke)
+    return b
+end
+local fishButton = navButton("fish", "AutoFish", "Łowienie", "≈", 145)
+local giftButton = navButton("gift", "AutoGift", "Prezenty + jajko", "+", 227)
+local selectionRail = surface(panel, 17, 166, 3, 28, C.white, 2)
+gradient(selectionRail, C.violet, C.cyan, 90)
+local incognitoButton = navButton("incognito", "Incognito", "Ukryj swój nick", "◈", 309)
+
+local details = make("CanvasGroup", {Position = UDim2.fromOffset(236, 115),
+    Size = UDim2.fromOffset(416, 270), BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0}, panel)
+round(details, 19)
+backgroundGradient(details, Color3.fromRGB(34, 33, 57), Color3.fromRGB(17, 26, 40), 40, 19)
+local detailsStroke = outline(details, Color3.new(1, 1, 1), 0.65)
+gradient(detailsStroke, C.violet, C.cyan, 25)
+-- Cicha dekoracja geometryczna w rogu karty.
+local orbit = make("Frame", {Position = UDim2.fromOffset(318, -42),
+    Size = UDim2.fromOffset(148, 148), BackgroundTransparency = 1,
+    Rotation = 25, BorderSizePixel = 0}, details)
+round(orbit, 48)
+local orbitEdge = outline(orbit, C.violet, 0.75, 1.5)
+gradient(orbitEdge, C.violet, C.cyan, 45)
+local orbitInner = surface(orbit, 23, 23, 102, 102, C.field, 34)
+orbitInner.BackgroundTransparency = 1
+outline(orbitInner, C.cyan, 0.85)
+local detailEyebrow = textAt(details, "AUTOMATYZACJA / 01", 24, 21, 310, 18, 10, C.cyan, true)
+local detailTitle = textAt(details, "AutoFish", 24, 52, 365, 42, 30, C.white, true)
+local detailDescription = textAt(details, "", 24, 105, 358, 74, 13, C.muted)
+detailDescription.TextYAlignment = Enum.TextYAlignment.Top
+local cardLine = surface(details, 24, 197, 368, 1, C.border, 1)
+cardLine.BackgroundTransparency = 0.5
+local stateDot = surface(details, 24, 226, 7, 7, C.muted, 4)
+local stateLabel = textAt(details, "Wyłączone", 40, 215, 212, 28, 12, C.muted, true)
+local switch = make("TextButton", {Position = UDim2.fromOffset(298, 214),
+    Size = UDim2.fromOffset(94, 34), BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0, Text = "", AutoButtonColor = false}, details)
+round(switch, 17)
+gradient(switch, C.violet, C.cyan, 15)
+local switchBorder = outline(switch, C.cyan, 0.65)
+local switchText = textAt(switch, "OFF", 32, 0, 56, 34, 10, C.white, true)
+switchText.TextXAlignment = Enum.TextXAlignment.Center
+local knob = surface(switch, 4, 4, 26, 26, C.white, 13)
+interact(switch, switchBorder)
+local selected = "fish"
+local selectionVersion = 0
+local descriptions = {
+    fish = "Automatycznie przyspiesza łowienie. Włącz i skup się na grze — panel zadba o klikanie dostępnego przycisku.",
+    gift = "Odbiera prezenty Playtime i darmowe jajko po zakończeniu timera 45 minut. Działa w tle przez funkcje przycisków gry.",
+    incognito = "Pokazuje BECZKASHOOP zamiast Twojego nicku w dostępnych napisach i tabelach. Zmiana tylko na Twoim ekranie; inni gracze widzą prawdziwy nick."
+}
+local optionTitles = {fish = "AutoFish", gift = "AutoGift", incognito = "Incognito"}
+local optionRows = {fish = 166, gift = 248, incognito = 330}
+local showRewardsReport
+local setIncognito
+local function refreshSelection()
+    local enabled = S[selected]
+    detailTitle.Text = optionTitles[selected]
+    detailDescription.Text = descriptions[selected]
+    detailEyebrow.Text = selected == "incognito" and "PRYWATNOŚĆ / 03"
+        or (selected == "fish" and "AUTOMATYZACJA / 01" or "AUTOMATYZACJA / 02")
+    stateLabel.Text = enabled and "Funkcja aktywna" or "Gotowe do włączenia"
+    switchText.Text = enabled and "ON" or "OFF"
+    animate(switchText, 0.28, {Position = UDim2.fromOffset(enabled and 4 or 32, 0)})
+    animate(knob, 0.32, {Position = UDim2.fromOffset(enabled and 64 or 4, 4)})
+    animate(switch, 0.3, {BackgroundColor3 = enabled and Color3.new(1, 1, 1)
+        or Color3.fromRGB(65, 71, 94)})
+    animate(stateDot, 0.3, {BackgroundColor3 = enabled and C.cyan or C.muted})
+    animate(stateLabel, 0.3, {TextColor3 = enabled and C.cyan or C.muted})
+    animate(selectionRail, 0.35, {Position = UDim2.fromOffset(17, optionRows[selected])})
+    for key, item in pairs(nav) do
+        animate(item.button, 0.3, {BackgroundColor3 = key == selected
+            and Color3.new(1, 1, 1) or Color3.fromRGB(110, 118, 143)})
+        animate(item.border, 0.3, {Transparency = key == selected and 0.25 or 0.8})
+        animate(item.dot, 0.3, {BackgroundColor3 = S[key] and C.cyan or C.muted})
+    end
+end
+local function selectOption(key)
+    if key == selected then return end
+    selected = key
+    selectionVersion = selectionVersion + 1
+    local version = selectionVersion
+    animate(details, 0.13, {GroupTransparency = 1, Position = UDim2.fromOffset(244, 115)})
+    task.delay(0.14, function()
+        if not S.alive or version ~= selectionVersion then return end
+        refreshSelection()
+        details.Position = UDim2.fromOffset(236, 123)
+        animate(details, 0.36, {GroupTransparency = 0, Position = UDim2.fromOffset(236, 115)})
+    end)
+end
+refreshSelection()
+local statusBox = surface(panel, 24, 400, 628, 42, Color3.fromRGB(14, 20, 31), 12)
+outline(statusBox, C.border, 0.8)
+local statusDot = surface(statusBox, 12, 18, 5, 5, C.cyan, 3)
+local status = textAt(statusBox, "Wpisz kod dostępu, aby odblokować funkcje.",
+    28, 4, 588, 34, 11, C.muted)
+textAt(panel, "F6  panel   ·   F7  raport nagród   ·   F8  zakończ", 28, 451, 410, 16, 10, C.muted)
+textAt(panel, "by beczkawtf", 549, 451, 106, 16, 10, C.muted)
+
+local restore = make("CanvasGroup", {Position = panel.Position,
+    Size = UDim2.fromOffset(206, 48), BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0, Active = true, Visible = false}, gui)
+round(restore, 15)
+backgroundGradient(restore, Color3.fromRGB(41, 32, 65), Color3.fromRGB(18, 42, 53), 25, 15)
+local restoreEdge = outline(restore, Color3.new(1, 1, 1), 0.4)
+gradient(restoreEdge, C.violet, C.cyan)
+textAt(restore, "beczkahub", 15, 5, 144, 37, 16, C.white, true)
+textAt(restore, "F6", 169, 5, 29, 37, 10, C.cyan, true)
+
+local ambientTweens = {}
+local function ambient(object, seconds, properties)
+    local tween = TweenService:Create(object,
+        TweenInfo.new(seconds, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), properties)
+    activeTweens[tween] = true
+    table.insert(ambientTweens, tween)
+end
+ambient(topGradient, 5, {Offset = Vector2.new(0.12, 0)})
+ambient(orbit, 7, {Rotation = 42})
+local function setAmbient(playing)
+    for _, tween in ipairs(ambientTweens) do
+        if playing then tween:Play() else tween:Pause() end
+    end
+end
+local function setStatus(text)
+    if S.alive and status.Text ~= text then
+        status.Text = text
+        status.TextTransparency = 0.25
+        animate(status, 0.25, {TextTransparency = 0})
+    end
+end
+-- Kod przeniesiony bez zmian z załączonego skryptu.
+local ACCESS_CODE = "72834KSFH223HS"
+local function validAccessCode(text)
+    return text:match("^%s*(.-)%s*$") == ACCESS_CODE
+end
+local licenseView = make("CanvasGroup", {
+    Name = "License", Position = UDim2.fromOffset(0, 94),
+    Size = UDim2.fromOffset(680, 350), BackgroundColor3 = C.bg,
+    BorderSizePixel = 0, Active = true, ZIndex = 30
+}, panel)
+backgroundGradient(licenseView, Color3.fromRGB(23, 25, 43), C.bg, 45, 18)
+local licenseTitle = textAt(licenseView, "Witaj w beczkahub", 80, 27, 520, 36, 25, C.white, true)
+licenseTitle.TextXAlignment = Enum.TextXAlignment.Center
+local licenseHint = textAt(licenseView, "Wpisz swój dotychczasowy kod dostępu.", 80, 74, 520, 25, 13, C.muted)
+licenseHint.TextXAlignment = Enum.TextXAlignment.Center
+local keyBox = make("TextBox", {
+    Position = UDim2.fromOffset(140, 119), Size = UDim2.fromOffset(400, 46),
+    BackgroundColor3 = C.field, BorderSizePixel = 0, Text = "",
+    PlaceholderText = "Kod dostępu…", PlaceholderColor3 = C.muted,
+    TextColor3 = C.white, Font = Enum.Font.Gotham, TextSize = 15,
+    ClearTextOnFocus = false, MultiLine = false
+}, licenseView)
+round(keyBox, 12)
+local keyBorder = outline(keyBox, C.violet, 0.5)
+local unlock = make("TextButton", {
+    Position = UDim2.fromOffset(140, 179), Size = UDim2.fromOffset(400, 44),
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+    Text = "Odblokuj dostęp", TextColor3 = C.bg,
+    Font = Enum.Font.GothamBold, TextSize = 14, AutoButtonColor = false
+}, licenseView)
+round(unlock, 12)
+gradient(unlock, C.violet, C.cyan, 10)
+interact(unlock, outline(unlock, C.cyan, 0.65))
+local licenseMessage = textAt(licenseView, "", 90, 239, 500, 40, 12, C.muted)
+licenseMessage.TextXAlignment = Enum.TextXAlignment.Center
+local function submitLicense()
+    if not S.alive or S.unlocked then return end
+    if not validAccessCode(keyBox.Text) then
+        licenseMessage.Text = "Nieprawidłowy kod dostępu. Spróbuj ponownie."
+        licenseMessage.TextColor3 = Color3.fromRGB(255, 151, 179)
+        animate(keyBorder, 0.2, {Color = Color3.fromRGB(255, 151, 179)})
+        return
+    end
+    S.unlocked = true
+    keyBox.Text = ""
+    keyBox.TextEditable = false
+    keyBox:ReleaseFocus()
+    unlock.Text = "Odblokowano"
+    licenseMessage.Text = "miłej gry <3"
+    licenseMessage.TextColor3 = C.cyan
+    setStatus("Dostęp odblokowany. Wybierz funkcję i użyj przełącznika.")
+    animate(licenseView, 0.35, {GroupTransparency = 1})
+    task.delay(0.36, function()
+        if S.alive then licenseView:Destroy() end
+    end)
+end
+connect(unlock.Activated, submitLicense)
+connect(keyBox.FocusLost, function(enterPressed)
+    if enterPressed then submitLicense() end
+end)
+
+local windowVersion = 0
+local windowOpen = true
+local function toggleWindow()
+    if not S.alive or S.starting then return end
+    windowVersion = windowVersion + 1
+    local version = windowVersion
+    windowOpen = not windowOpen
+    if windowOpen then
+        restore.Visible = false
+        panel.Visible = true
+        panelScale.Scale = fitScale * 0.97
+        animate(panel, 0.3, {GroupTransparency = 0})
+        animate(panelScale, 0.38, {Scale = fitScale})
+        setAmbient(true)
+    else
+        setAmbient(false)
+        animate(panel, 0.2, {GroupTransparency = 1})
+        animate(panelScale, 0.24, {Scale = fitScale * 0.97})
+        task.delay(0.24, function()
+            if not S.alive or version ~= windowVersion then return end
+            panel.Visible = false
+            restore.Position = panel.Position
+            restore.Visible = true
+            restore.GroupTransparency = 1
+            animate(restore, 0.25, {GroupTransparency = 0})
+        end)
+    end
+end
+
+-- Dostęp do symulowania kliknięć.
+local backendOK, VI = pcall(function()
+    return UIS:CreateVirtualInput()
+end)
+
+if not backendOK then
+    VI = nil
+end
+
+local function release()
+    if not S.held then return true end
+
+    local success, err = pcall(function()
+        VI:SendMouseButton(
+            S.held,
+            Enum.UserInputType.MouseButton1,
+            false,
+            0
+        )
+    end)
+
+    if success or string.find(
+        tostring(err), "duplicate button state", 1, true
+    ) then
+        S.held = nil
+        return true
+    end
+
+    return false, err
+end
+
+local function allowed()
+    if not VI then
+        setStatus("Executor nie udostępnia wymaganej funkcji kliknięć.")
+        return false
+    end
+
+    return true
+end
+
+local nextGiftCheck = 0
+
+connect(fishButton.Activated, function() selectOption("fish") end)
+connect(giftButton.Activated, function() selectOption("gift") end)
+connect(incognitoButton.Activated, function() selectOption("incognito") end)
+connect(switch.Activated, function()
+    if not S.unlocked then
+        setStatus("Najpierw wpisz poprawny kod dostępu.")
+        return
+    end
+    if selected == "incognito" then
+        local enabled = not S.incognito
+        setStatus(enabled and "Incognito: ukrywam nick jako BECZKASHOOP…" or "Incognito wyłączone — przywrócono napisy.")
+        setIncognito(enabled)
+        refreshSelection()
+        return
+    end
+    if not S[selected] then
+        if selected == "fish" and not allowed() then return end
+        if selected == "gift" then
+            local supported, reason = checkRewardBackend()
+            if not S.alive then return end
+            if not supported then
+                setStatus("AutoGift niedostępny: " .. reason)
+                warn("[BECZKA HUB] " .. reason)
+                return
+            end
+        end
+    end
+    S[selected] = not S[selected]
+    if selected == "gift" then
+        nextGiftCheck = 0
+        if not S.gift and S.giftJob then
+            if S.giftJob.thread then pcall(task.cancel, S.giftJob.thread) end
+            S.giftJob = nil
+        end
+    end
+    refreshSelection()
+    local name = selected == "fish" and "AutoFish" or "AutoClaimGift"
+    setStatus(name .. (S[selected] and " włączone." or " wyłączone."))
+end)
+
+connect(minimize.Activated, toggleWindow)
+
+-- Przeciąganie.
+local handle = make("Frame", {
+    Size = UDim2.new(1, -128, 0, 85),
+    BackgroundTransparency = 1,
+    Active = true,
+    ZIndex = 10
+}, panel)
+
+local dragging = false
+local dragInput
+local dragStart
+local startPosition
+local moved = false
+local smallDrag = false
+
+local function beginDrag(input, small)
+    if dragging then return end
+
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+
+    dragging = true
+    dragInput = input
+    dragStart = input.Position
+    startPosition = small and restore.Position or panel.Position
+    moved = false
+    smallDrag = small
+end
+
+connect(handle.InputBegan, function(input)
+    beginDrag(input, false)
+end)
+
+connect(restore.InputBegan, function(input)
+    beginDrag(input, true)
+end)
+
+connect(UIS.InputChanged, function(input)
+    if not dragging or not S.alive then return end
+
+    if dragInput.UserInputType == Enum.UserInputType.MouseButton1 then
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+            return
+        end
+    elseif input ~= dragInput then
+        return
+    end
+
+    local delta = input.Position - dragStart
+    if delta.Magnitude > 5 then moved = true end
+    if not moved then return end
+
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    local viewport = camera.ViewportSize
+    local size = smallDrag and restore.AbsoluteSize or panel.AbsoluteSize
+
+    local x = math.clamp(
+        startPosition.X.Offset + delta.X,
+        0,
+        math.max(0, viewport.X - size.X)
+    )
+
+    local y = math.clamp(
+        startPosition.Y.Offset + delta.Y,
+        0,
+        math.max(0, viewport.Y - size.Y)
+    )
+
+    panel.Position = UDim2.fromOffset(x, y)
+    restore.Position = panel.Position
+end)
+
+connect(UIS.InputEnded, function(input)
+    if not dragging or input ~= dragInput then return end
+
+    local reopen = smallDrag and not moved
+    dragging = false
+    dragInput = nil
+
+    if reopen then toggleWindow() end
+end)
+
+S.stop = function()
+    if not S.alive then return end
+
+    if setIncognito then setIncognito(false) end
+    S.alive = false
+    S.fish = false
+    S.gift = false
+    if S.giftJob and S.giftJob.thread then pcall(task.cancel, S.giftJob.thread) end
+    S.giftJob = nil
+    release()
+
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+
+    for tween in pairs(activeTweens) do tween:Cancel() end
+    table.clear(activeTweens)
+    gui:Destroy()
+end
+
+connect(close.Activated, function()
+    S.stop()
+end)
+
+connect(UIS.InputBegan, function(input)
+    if input.KeyCode == Enum.KeyCode.F8 then
+        S.stop()
+    elseif input.KeyCode == Enum.KeyCode.F7 then
+        if showRewardsReport then showRewardsReport() end
+    elseif input.KeyCode == Enum.KeyCode.F6
+        and not UIS:GetFocusedTextBox() then
+        toggleWindow()
+    end
+end)
+
+-- Intro Aurora: biały logotyp, czerń i subtelne światło.
+local intro = make("CanvasGroup", {
+    Name = "BeczkaIntro", Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Color3.fromRGB(3, 4, 9), BorderSizePixel = 0,
+    Active = true, ZIndex = 50
+}, gui)
+local content = make("CanvasGroup", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(440, 290), BackgroundTransparency = 1,
+    GroupTransparency = 1
+}, intro)
+local introScale = make("UIScale", {Scale = 0.9}, content)
+local emblem = surface(content, 192, 18, 56, 56, Color3.fromRGB(22, 22, 37), 18)
+local emblemEdge = outline(emblem, Color3.new(1, 1, 1), 0.15)
+gradient(emblemEdge, C.violet, C.cyan, 35)
+gradient(emblem, Color3.fromRGB(87, 73, 131), Color3.fromRGB(41, 83, 103), 35)
+local emblemText = textAt(emblem, "b", 0, -1, 56, 56, 34, C.white, true)
+emblemText.TextXAlignment = Enum.TextXAlignment.Center
+local introTitle = textAt(content, "beczkahub", 0, 96, 440, 61, 46, C.white, true)
+introTitle.TextXAlignment = Enum.TextXAlignment.Center
+local tagline = textAt(content, "M A D E   B Y   B E C Z K A W T F", 0, 167, 440, 20, 10, C.muted)
+tagline.TextXAlignment = Enum.TextXAlignment.Center
+local light = surface(content, 45, 201, 350, 1, Color3.new(1, 1, 1), 1)
+local lightGradient = gradient(light, C.violet, C.cyan)
+lightGradient.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.1),
+    NumberSequenceKeypoint.new(1, 1)})
+local track = surface(content, 132, 228, 176, 3, Color3.fromRGB(30, 32, 48), 2)
+track.ClipsDescendants = true
+local fill = make("Frame", {Size = UDim2.fromScale(0, 1),
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0}, track)
+round(fill, 2)
+gradient(fill, C.violet, C.cyan)
+local hint = textAt(content, "Wchodzimy do gry", 0, 246, 440, 18, 11, C.muted)
+hint.TextXAlignment = Enum.TextXAlignment.Center
+-- Pasek jest dekoracją intro, nie miernikiem pobierania zasobów.
+task.spawn(function()
+    local camera = workspace.CurrentCamera
+    local introFit = camera and math.min(1, camera.ViewportSize.X / 480,
+        camera.ViewportSize.Y / 340) or 1
+    introScale.Scale = introFit * 0.9
+    animate(content, 0.8, {GroupTransparency = 0})
+    animate(introScale, 1.1, {Scale = introFit})
+    emblem.Rotation = -12
+    animate(emblem, 1.1, {Rotation = 0})
+    task.wait(0.45)
+    if not S.alive then return end
+    animate(fill, 1.5, {Size = UDim2.fromScale(1, 1)})
+    animate(lightGradient, 1.8, {Offset = Vector2.new(0.08, 0)})
+    task.wait(1.5)
+    if not S.alive then return end
+    hint.Text = "Wszystko na swoim miejscu."
+    task.wait(0.25)
+    if not S.alive then return end
+    animate(content, 0.4, {GroupTransparency = 1})
+    animate(introScale, 0.5, {Scale = introFit * 1.04})
+    task.wait(0.4)
+    if not S.alive then return end
+    panel.Visible = true
+    panelScale.Scale = fitScale * 0.94
+    animate(intro, 0.55, {GroupTransparency = 1})
+    animate(panel, 0.65, {GroupTransparency = 0})
+    animate(panelScale, 0.8, {Scale = fitScale})
+    task.wait(0.8)
+    if not S.alive then return end
+    intro:Destroy()
+    S.starting = false
+    setAmbient(true)
+end)
+
+-- Pomocnicze funkcje interfejsu gry.
+local function visible(object)
+    if not object or not object:IsA("GuiObject") then return false end
+    if object:IsDescendantOf(gui) then return false end
+
+    local current = object
+
+    while current and current ~= PG do
+        if current:IsA("GuiObject") and not current.Visible then
+            return false
+        elseif current:IsA("ScreenGui") and not current.Enabled then
+            return false
+        end
+
+        current = current.Parent
+    end
+
+    return object:IsDescendantOf(PG)
+end
+
+local function inside(object, position)
+    if not object.Visible then return false end
+
+    local p = object.AbsolutePosition
+    local size = object.AbsoluteSize
+
+    return position.X >= p.X and position.X <= p.X + size.X
+        and position.Y >= p.Y and position.Y <= p.Y + size.Y
+end
+
+local nextClickAllowed = 0
+
+local function click(object)
+    if not S.alive or S.starting or dragging or UIS:GetFocusedTextBox() then
+        return false
+    end
+
+    if os.clock() < nextClickAllowed then return false end
+    if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+        return false
+    end
+    if not visible(object) then return false end
+
+    local size = object.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return false end
+
+    local position = object.AbsolutePosition + size / 2
+    local ancestor = object.Parent
+
+    while ancestor and ancestor ~= PG do
+        if ancestor:IsA("GuiObject") and ancestor.ClipsDescendants then
+            local p = ancestor.AbsolutePosition
+            local s = ancestor.AbsoluteSize
+
+            if position.X < p.X or position.X > p.X + s.X
+                or position.Y < p.Y or position.Y > p.Y + s.Y then
+                return false
+            end
+        end
+
+        ancestor = ancestor.Parent
+    end
+
+    local screen = object:FindFirstAncestorWhichIsA("ScreenGui")
+    if screen and not screen.IgnoreGuiInset then
+        position = position + GS:GetGuiInset()
+    end
+
+    local camera = workspace.CurrentCamera
+    if not camera then return false end
+
+    local viewport = camera.ViewportSize
+    if position.X < 0 or position.Y < 0
+        or position.X >= viewport.X or position.Y >= viewport.Y then
+        return false
+    end
+
+    if inside(panel, position) or inside(restore, position) then
+        setStatus("Panel zasłania cel. Przesuń go lub użyj F6.")
+        return false
+    end
+
+    local released, err = release()
+    if not released then error(tostring(err), 0) end
+
+    if not S.alive or not visible(object)
+        or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+        return false
+    end
+    local pressed, pressError = pcall(function()
+        VI:SendMouseButton(
+            position, Enum.UserInputType.MouseButton1, true, 0
+        )
+    end)
+    if not pressed then
+        nextClickAllowed = os.clock() + 0.35
+        if string.find(tostring(pressError), "duplicate button state", 1, true) then
+            setStatus("Kliknięcie zajęte — czekam na zwolnienie myszy.")
+            return false
+        end
+        error(tostring(pressError), 0)
+    end
+    S.held = position
+    task.wait(0.02)
+
+    local releasedNow, releaseError = release()
+    if not releasedNow then error(tostring(releaseError), 0) end
+
+    return true
+end
+
+local function normalized(text)
+    return string.lower(text):gsub("<[^>]*>", ""):gsub("[%s_%-!]", "")
+end
+
+-- BEGIN INCOGNITO
+local INCOGNITO_NAME = "BECZKASHOOP"
+local privacyConnections = {}
+local privacyRecords = setmetatable({}, {__mode = "k"})
+local privacyGeneration = 0
+local privacyTask
+local aliases = {Players.LocalPlayer.Name, Players.LocalPlayer.DisplayName}
+table.sort(aliases, function(a, b) return #a > #b end)
+
+local function replaceName(text)
+    for _, alias in ipairs(aliases) do
+        if alias ~= "" and alias ~= INCOGNITO_NAME then
+            local lower, needle = string.lower(text), string.lower(alias)
+            local parts, from = {}, 1
+            while true do
+                local first, last = string.find(lower, needle, from, true)
+                if not first then table.insert(parts, text:sub(from)); break end
+                local before, after = text:sub(first - 1, first - 1), text:sub(last + 1, last + 1)
+                local whole = (first == 1 or not before:match("[%w_]"))
+                    and (last == #text or not after:match("[%w_]"))
+                table.insert(parts, text:sub(from, first - 1))
+                table.insert(parts, whole and INCOGNITO_NAME or text:sub(first, last))
+                from = last + 1
+            end
+            text = table.concat(parts)
+        end
+    end
+    return text
+end
+
+local function maskText(text, rich)
+    if not rich then return replaceName(text) end
+    local pieces, from = {}, 1
+    while true do
+        local first, last = text:find("<[^>]*>", from)
+        if not first then table.insert(pieces, replaceName(text:sub(from))); break end
+        table.insert(pieces, replaceName(text:sub(from, first - 1)))
+        table.insert(pieces, text:sub(first, last))
+        from = last + 1
+    end
+    return table.concat(pieces)
+end
+
+local function privacyConnect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(privacyConnections, connection)
+end
+
+local function watchPrivateText(object)
+    if not S.incognito or privacyRecords[object] or object:IsDescendantOf(gui) then return end
+    local property
+    if object:IsA("TextLabel") or object:IsA("TextButton") then
+        property = "Text"
+    elseif object:IsA("Humanoid") and Players.LocalPlayer.Character
+        and object:IsDescendantOf(Players.LocalPlayer.Character) then
+        property = "DisplayName"
+    else
+        return
+    end
+    local record = {property = property, original = object[property]}
+    privacyRecords[object] = record
+    local function update()
+        if not S.alive or not S.incognito or not object.Parent then return end
+        local current = object[property]
+        if current == record.masked then return end
+        record.original = current
+        local masked = property == "DisplayName" and INCOGNITO_NAME
+            or maskText(current, object.RichText)
+        record.masked = masked
+        if current ~= masked then object[property] = masked end
+    end
+    privacyConnect(object:GetPropertyChangedSignal(property), function()
+        pcall(update)
+    end)
+    update()
+end
+
+setIncognito = function(enabled)
+    privacyGeneration = privacyGeneration + 1
+    local generation = privacyGeneration
+    if privacyTask then pcall(task.cancel, privacyTask); privacyTask = nil end
+    S.incognito = enabled
+    for _, connection in ipairs(privacyConnections) do connection:Disconnect() end
+    table.clear(privacyConnections)
+    for object, record in pairs(privacyRecords) do
+        pcall(function()
+            if object[record.property] == record.masked then
+                object[record.property] = record.original
+            end
+        end)
+    end
+    privacyRecords = setmetatable({}, {__mode = "k"})
+    if not enabled then return end
+    local roots = {PG, workspace}
+    local coreOK, core = pcall(function()
+        local value = game:GetService("CoreGui")
+        value:GetChildren() -- Sprawdź uprawnienia przed skanowaniem.
+        return value
+    end)
+    if coreOK and core then table.insert(roots, core) end
+    for _, root in ipairs(roots) do
+        pcall(function()
+            privacyConnect(root.DescendantAdded, function(object)
+                pcall(watchPrivateText, object)
+            end)
+        end)
+    end
+    privacyConnect(Players.LocalPlayer.CharacterAdded, function(character)
+        for _, object in ipairs(character:GetDescendants()) do
+            pcall(watchPrivateText, object)
+        end
+    end)
+    -- Jednorazowy skan w porcjach; później tylko zdarzenia zmian tekstu.
+    privacyTask = task.spawn(function()
+        local count = 0
+        for _, root in ipairs(roots) do
+            local ok, objects = pcall(function() return root:GetDescendants() end)
+            if ok then
+                for _, object in ipairs(objects) do
+                    if not S.alive or not S.incognito or generation ~= privacyGeneration then return end
+                    pcall(watchPrivateText, object)
+                    count = count + 1
+                    if count % 150 == 0 then task.wait() end
+                end
+            end
+        end
+        if S.alive and S.incognito and generation == privacyGeneration then
+            setStatus(coreOK and "Incognito: BECZKASHOOP — podmiana lokalna aktywna."
+                or "Incognito aktywne. Systemowa topka Roblox może pozostać bez zmian (brak dostępu).")
+        end
+    end)
+end
+-- END INCOGNITO
+
+-- BEGIN BACKGROUND GIFTS
+local function child(root, ...)
+    for _, name in ipairs({...}) do root = root and root:FindFirstChild(name) end
+    return root
+end
+local function textObject(object)
+    return object:IsA("TextLabel") or object:IsA("TextButton")
+end
+local function cleanText(text)
+    return normalized(text):gsub("[^%w:]", "")
+end
+local function timerSeconds(text)
+    text = text:gsub("<[^>]*>", ""):match("^%s*(.-)%s*$")
+    local h, m, s = text:match("^(%d+):(%d%d):(%d%d)$")
+    if h then return tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) end
+    m, s = text:match("^(%d+):(%d%d)$")
+    if m then return tonumber(m)*60 + tonumber(s) end
+end
+local function rewardHandler(button, attempt)
+    local event = attempt == 1 and "MouseButton1Click" or "Activated"
+    if rewardBackend == "signal" then
+        return function(...) return signalEmitter(button[event], ...) end, event
+    end
+    if rewardBackend ~= "callback" then return nil, "Brak sprawdzonego mechanizmu odbioru." end
+    local ok, list = pcall(getConnections, button[event])
+    if not ok or type(list) ~= "table" then return nil, "Brak dostępu do " .. event end
+    local callback
+    for _, connection in ipairs(list) do
+        local readable, fn, enabled = pcall(function() return connection.Function, connection.Enabled end)
+        if readable and enabled ~= false and type(fn) == "function" then
+            if callback and callback ~= fn then return nil, "Niejednoznaczna obsługa " .. event end
+            callback = fn
+        end
+    end
+    return callback, event
+end
+local rewardAttempts = setmetatable({}, {__mode = "k"})
+local function eggWindow(frames, now)
+    return child(frames, "PlaytimeEgg")
+end
+local function eggState(window)
+    local claim = child(window, "Main", "Claim")
+    local timer = child(window, "Main", "PlayTime", "TextLabel")
+    if not claim or not claim:IsA("GuiButton") or not timer or not textObject(timer) then return nil end
+    local seconds = timerSeconds(timer.Text)
+    local ready = seconds == 0 or cleanText(timer.Text) == "ready"
+    -- Zignoruj CantClaim i RobuxBuy; zamknięte okno nie blokuje odczytu timera.
+    return claim, ready and claim.Visible, seconds
+end
+local rewardTrace = {}
+local function traceReward(message)
+    table.insert(rewardTrace, message)
+    if #rewardTrace > 18 then table.remove(rewardTrace, 1) end
+end
+local function stopGift(reason)
+    S.gift = false
+    if S.giftJob and S.giftJob.thread then pcall(task.cancel, S.giftJob.thread) end
+    S.giftJob = nil
+    refreshSelection()
+    setStatus("AutoGift: " .. reason)
+    warn("[BECZKA HUB rewards-v2] " .. reason)
+end
+local function queueReward(button, kind, verify, now)
+    local attempts = rewardAttempts[button] or 0
+    if attempts >= 2 then return false end
+    local attempt = attempts + 1
+    rewardAttempts[button] = attempt
+    local callback, event = rewardHandler(button, attempt)
+    if not callback then traceReward(kind .. ": " .. tostring(event)); return false end
+    traceReward(kind .. ": próba " .. tostring(attempt) .. " / " .. tostring(event))
+    local job = {started = now, verify = verify, button = button, kind = kind}
+    S.giftJob = job
+    setStatus("Próba odbioru: " .. kind .. "…")
+    job.thread = task.spawn(function()
+        local ok, err
+        if event == "Activated" then ok, err = pcall(callback, nil, 1)
+        else ok, err = pcall(callback) end
+        job.error = not ok and tostring(err) or nil
+        job.finished = os.clock()
+        job.done = true
+    end)
+    return true
+end
+local function stepGifts(now)
+    if not S.gift or S.starting then return end
+    local job = S.giftJob
+    if job then
+        if job.done then
+            local verified, confirmed = pcall(job.verify)
+            if verified and confirmed then
+                S.giftJob = nil
+                traceReward(job.kind .. ": potwierdzona zmiana stanu")
+                setStatus("Gra zaktualizowała stan nagrody: " .. job.kind .. ".")
+            elseif job.error or now - job.finished >= 3 then
+                traceReward(job.kind .. ": " .. (job.error or "callback zakończony, stan nagrody bez zmian"))
+                S.giftJob = nil
+                if job.error then warn("[BECZKA HUB rewards-v2]", job.kind, job.error) end
+            end
+        elseif now - job.started >= 8 then
+            if job.thread then pcall(task.cancel, job.thread) end
+            S.giftJob = nil
+            rewardAttempts[job.button] = 2
+            traceReward(job.kind .. ": przekroczono 8 sekund")
+            setStatus("AutoGift: funkcja " .. job.kind .. " nie odpowiedziała.")
+        end
+        return
+    end
+    local frames = child(PG, "UI", "Base", "Frames")
+    local window = eggWindow(frames, now)
+    local egg, eggReady, remaining = eggState(window)
+    if egg and remaining and remaining > 0 then rewardAttempts[egg] = nil end
+    if egg and eggReady then
+        if queueReward(egg, "jajko 45 min", function()
+            local _, _, seconds = eggState(window)
+            return seconds ~= nil and seconds > 0
+        end, now) then return end
+    end
+    local gifts = child(frames, "PlaytimeGifts", "Main", "Gifts")
+    local blocked = false
+    if gifts then
+        local list = gifts:GetChildren()
+        table.sort(list, function(a,b) return a.Name < b.Name end)
+        for _, button in ipairs(list) do
+            if button:IsA("GuiButton") and button.Name:match("^Gift%d+$") then
+                local label = button:FindFirstChild("TimeDisplay")
+                if label and textObject(label) then
+                    if cleanText(label.Text) == "ready" then
+                        if queueReward(button, button.Name, function()
+                            return label.Parent ~= nil and cleanText(label.Text) ~= "ready"
+                        end, now) then return end
+                        blocked = true
+                    else
+                        rewardAttempts[button] = nil
+                    end
+                end
+            end
+        end
+    end
+    if blocked or egg and eggReady and (rewardAttempts[egg] or 0) >= 2 then
+        setStatus("AutoGift: brak potwierdzenia odbioru. F7: raport nagród.")
+    elseif not gifts then
+        setStatus("AutoGift: czekam na PlaytimeGifts.Main.Gifts.")
+    elseif not window or not egg then
+        setStatus("Prezenty aktywne. Brak rozpoznanego przycisku jajka — F7: raport.")
+    elseif remaining and remaining > 0 then
+        setStatus(string.format("Prezenty aktywne · jajko za %d:%02d", math.floor(remaining/60), remaining%60))
+    elseif remaining == nil and not eggReady then
+        setStatus("Prezenty aktywne. Czekam na timer / Ready jajka.")
+    else
+        setStatus("AutoGift: czekam na dostępne nagrody.")
+    end
+end
+-- END BACKGROUND GIFTS
+
+showRewardsReport = function()
+    local old = gui:FindFirstChild("RewardReport")
+    if old then old:Destroy();return end
+    local rows = {"BECZKA REWARDS / 5", "PlaceId=" .. tostring(game.PlaceId)}
+    local backendOK, backendReason = checkRewardBackend()
+    table.insert(rows, "Test dostępu: " .. tostring(backendOK) .. " | " .. backendReason .. " | tryb=" .. tostring(rewardBackend))
+    local frames = child(PG, "UI", "Base", "Frames")
+    if frames then
+        for _, window in ipairs(frames:GetChildren()) do
+            local name = string.lower(window.Name)
+            if name:find("playtime",1,true) or name == "freeegg" or name == "partyegg" then
+                table.insert(rows,"WINDOW: " .. window.Name .. " visible=" .. tostring(window.Visible))
+                local n = 0
+                for _, o in ipairs(window:GetDescendants()) do
+                    local isText = textObject(o)
+                    local t = isText and cleanText(o.Text) or ""
+                    if o:IsA("GuiButton") or isText and (timerSeconds(o.Text) ~= nil
+                        or t == "claim" or t == "ready" or t == "playtimeegg") then
+                        n = n+1
+                        if n <= 65 then
+                            local row = o:GetFullName():gsub("Players%.[^.]+%.", "Players.<player>.")
+                            if isText then row = row .. " | " .. string.format("%q",o.Text) end
+                            if o:IsA("GuiButton") then
+                                for i, event in ipairs({"Click","Activated"}) do
+                                    local fn = rewardHandler(o,i)
+                                    row = row .. " | " .. event .. "=" .. tostring(type(fn)=="function")
+                                end
+                            end
+                            table.insert(rows,row)
+                        end
+                    end
+                end
+            end
+        end
+    else table.insert(rows,"Brak UI.Base.Frames") end
+    table.insert(rows, "=== OSTATNIE PRÓBY ===")
+    for _, line in ipairs(rewardTrace) do table.insert(rows, line) end
+    table.insert(rows, "=== OBSŁUGA KONKRETNYCH PRZYCISKÓW — TYLKO ODCZYT ===")
+    local targets = {
+        child(frames, "PlaytimeGifts", "Main", "Gifts", "Gift1"),
+        child(frames, "PlaytimeEgg", "Main", "Claim")
+    }
+    local debugAPI = env.debug or debug
+    for _, button in pairs(targets) do
+        table.insert(rows, "BUTTON: " .. button.Name)
+        for _, event in ipairs({"MouseButton1Click", "Activated", "MouseButton1Down", "MouseButton1Up", "InputBegan", "InputEnded"}) do
+            local ok, list = pcall(function() return getConnections(button[event]) end)
+            if ok and type(list) == "table" then
+                table.insert(rows, event .. ": " .. tostring(#list) .. " połączeń")
+                for index, connection in ipairs(list) do
+                    if index > 3 then break end
+                    local readable, fn = pcall(function() return connection.Function end)
+                    if readable and type(fn) == "function" and debugAPI then
+                        if type(debugAPI.getinfo) == "function" then
+                            local infoOK, info = pcall(debugAPI.getinfo, fn)
+                            if infoOK and type(info) == "table" then
+                                table.insert(rows, "  źródło=" .. tostring(info.short_src or info.source)
+                                    .. " linia=" .. tostring(info.linedefined) .. " nazwa=" .. tostring(info.name))
+                            end
+                        end
+                        if type(debugAPI.getconstants) == "function" then
+                            local constantsOK, constants = pcall(debugAPI.getconstants, fn)
+                            if constantsOK and type(constants) == "table" then
+                                local values = {}
+                                for _, value in pairs(constants) do
+                                    if type(value) == "string" and #value <= 100 and #values < 16 then
+                                        table.insert(values, string.format("%q", value))
+                                    end
+                                end
+                                table.insert(rows, "  stałe=" .. table.concat(values, ", "))
+                            end
+                        end
+                    end
+                end
+            else table.insert(rows, event .. ": brak dostępu") end
+        end
+    end
+    local modal = make("Frame", {Name="RewardReport", AnchorPoint=Vector2.new(0.5,0.5),
+        Position=UDim2.fromScale(0.5,0.5), Size=UDim2.fromScale(0.85,0.75),
+        BackgroundColor3=C.bg, BorderSizePixel=0, ZIndex=100},gui)
+    round(modal,14)
+    textAt(modal,"Raport nagród: kliknij tekst → Ctrl+A → Ctrl+C. F7 zamyka.",16,8,620,42,13,C.white,true)
+    local box = make("TextBox", {Position=UDim2.fromOffset(16,56),Size=UDim2.new(1,-32,1,-72),
+        BackgroundColor3=C.field,TextColor3=C.white,Font=Enum.Font.Code,TextSize=12,
+        ClearTextOnFocus=false,MultiLine=true,TextWrapped=false,
+        TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+        Text=table.concat(rows,"\n")},modal)
+    local closeReport = make("TextButton", {Position=UDim2.new(1,-48,0,10),Size=UDim2.fromOffset(32,32),
+        Text="×",TextSize=20,TextColor3=C.white,BackgroundColor3=C.field},modal)
+    connect(closeReport.Activated,function() modal:Destroy() end)
+end
+
+
+
+
+local lastWarning = -math.huge
+
+-- AutoGift nie korzysta z kliknięć, nie otwiera ani nie zamyka okien gry.
+while S.alive do
+    local now = os.clock()
+    if S.held then release() end
+    if S.unlocked and S.gift and now >= nextGiftCheck then
+        nextGiftCheck = now + 0.75
+        local success, err = pcall(stepGifts, now)
+        if not success then stopGift(tostring(err)) end
+    end
+    if S.unlocked and S.fish and not S.starting and not dragging
+        and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+        and not UIS:GetFocusedTextBox() then
+        local success, err = pcall(function()
+            local fishingGui = PG:FindFirstChild("FishingGui")
+            local fishing = fishingGui and fishingGui:FindFirstChild("Fishing")
+            local target = fishing and fishing:FindFirstChild("ClickSpeedUpActive", true)
+            if visible(target) then
+                if click(target) and not S.gift then setStatus("AutoFish działa.") end
+            elseif not S.gift then
+                setStatus("Czekam na cel łowienia...")
+            end
+        end)
+        if not success and S.alive then
+            release()
+            if os.clock() - lastWarning >= 10 then
+                lastWarning = os.clock()
+                setStatus("AutoFish: błąd kliknięcia — zamknij F9/menu.")
+                warn("[BECZKA HUB background-v1]", err)
+            end
+        end
+    end
+    task.wait(S.fish and 0.06 or 0.15)
+end
+
+release()
+
+if env.__AutoFishPanel == S then
+    env.__AutoFishPanel = nil
+end
